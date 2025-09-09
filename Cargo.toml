@@ -31,7 +31,7 @@ tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
 
 # Ethereum/Alloy
 alloy = { version = "1.0.16", features = ["full"] }
-amms = "0.7.2"
+alloy-mev = { git = "https://github.com/leruaa/alloy-mev", branch = "main" }
 
 # Async utilities
 futures = "0.3.31"
