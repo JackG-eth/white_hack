@@ -1,19 +1,21 @@
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc};
 
 use alloy::{
     network::{EthereumWallet, TxSigner},
-    primitives::{address, Address, U256},
+    primitives::{address, Address, Bytes, U256},
     providers::{Provider, ProviderBuilder, WsConnect},
-    rpc::types::mev::EthSendBundle,
+    rpc::types::{mev::EthSendBundle, TransactionInput, TransactionRequest},
     signers::local::PrivateKeySigner,
     sol,
 };
-use alloy_mev::EthMevProviderExt;
+use alloy_mev::{BundleSigner, EthMevProviderExt};
 use eyre::Result;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
+
+use crate::helpers::{get_provider, ProviderWrapper};
 
 
 pub mod helpers;
@@ -68,41 +70,15 @@ async fn check_locked_status<P: Provider>(
     Ok(locked_status)
 }
 
-/// Sends a standalone release transaction if needed.
-async fn send_release_transaction<P: Provider>(
-    provider: &P,
-    signer: &PrivateKeySigner,
-    contract_address: Address,
-) -> Result<()> {
-    let contract = ILevvaAirdrop::new(contract_address, provider);
-    let tx = contract
-        .release()
-        .from(signer.address())
-        // Optional: Customize gas settings
-        // .gas_limit(100_000)
-        // .max_fee_per_gas(U256::from(50_000_000_000)) // 50 gwei
-        // .max_priority_fee_per_gas(U256::from(2_000_000_000)) // 2 gwei
-        .send()
-        .await
-        .map_err(|e| eyre::eyre!("Failed to send release transaction: {}", e))?;
-
-    let receipt = tx
-        .get_receipt()
-        .await
-        .map_err(|e| eyre::eyre!("Failed to get transaction receipt: {}", e))?;
-
-    info!("Release transaction sent: {:?}", receipt.transaction_hash);
-    Ok(())
-}
-
 /// Creates a bundle of release and transfer transactions.
-async fn create_transaction_bundle<P: Provider>(
-    provider: &P,
+async fn create_transaction_bundle(
+    provider: &ProviderWrapper,
     signer: &PrivateKeySigner,
     airdrop_contract_address: Address,
     token_address: Address,
     to_address: Address,
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<Vec<Bytes>> {
+
     let nonce = provider
         .get_transaction_count(signer.address())
         .await
@@ -114,36 +90,20 @@ async fn create_transaction_bundle<P: Provider>(
         .release()
         .from(signer.address())
         .nonce(nonce)
-        // Optional: Customize gas settings
-        // .gas_limit(100_000)
-        // .max_fee_per_gas(U256::from(50_000_000_000)) // 50 gwei
-        // .max_priority_fee_per_gas(U256::from(2_000_000_000)) // 2 gwei
         .into_transaction_request();
+    let encoded_release_tx = provider.encode_request(release_tx).await?;
 
-
-    // Create transfer transaction
-    let token_contract = IERC20::new(token_address, provider);
-    let transfer_tx = token_contract
-        .transfer(to_address, *TRANSFER_AMOUNT)
+    let erc20_contract = IERC20::new(token_address, provider);
+    let transfer_tx = erc20_contract
+        .transferFrom(HACKED_ADDRESS, to_address, *TRANSFER_AMOUNT)
         .from(signer.address())
-        .nonce(nonce + U256::from(1))
-        // Optional: Customize gas settings
-        // .gas_limit(80_000)
-        // .max_fee_per_gas(U256::from(50_000_000_000)) // 50 gwei
-        // .max_priority_fee_per_gas(U256::from(2_000_000_000)) // 2 gwei
+        .nonce(nonce)
         .into_transaction_request();
 
-    // Sign transactions
-    let release_signed = signer
-        .sign_transaction(&release_tx)
-        .await
-        .map_err(|e| eyre::eyre!("Failed to sign release transaction: {}", e))?;
-    let transfer_signed = signer
-        .sign_transaction(&transfer_tx)
-        .await
-        .map_err(|e|  eyre::eyre!("Failed to sign transfer transaction: {}", e))?;
 
-    Ok(vec![release_signed, transfer_signed])
+    let encoded_transfer_tx = provider.encode_request(transfer_tx).await?;
+
+    Ok(vec![encoded_release_tx, encoded_transfer_tx])
 }
 
 #[tokio::main]
@@ -158,22 +118,23 @@ async fn main() -> Result<()> {
 
     // Load configuration
     let config = config::load_config().map_err(|e|  eyre::eyre!("Failed to load configuration: {}", e))?;
-
+ 
     // Create signer from private key
     let chris_signer = PrivateKeySigner::from_str(&config.ethereum.priv_key)
         .map_err(|e| eyre::eyre!("Failed to parse private key: {}", e))?;
     let wallet = EthereumWallet::new(chris_signer.clone());
 
     // Initialize Ethereum provider with signer
-    let provider = ProviderBuilder::new()
-        .wallet(wallet)
-        .connect_ws(WsConnect::new(config.ethereum.ws_endpoint)).await?;
+    let provider = get_provider(&config, wallet).await?;
 
     // Configure MEV bundle endpoints
+
+    // Select which builders the bundle will be sent to
     let endpoints = provider
         .endpoints_builder()
-        .flashbots(chris_signer.clone())
         .beaverbuild()
+        .titan(BundleSigner::flashbots(chris_signer.clone()))
+        .flashbots(BundleSigner::flashbots(chris_signer.clone()))
         .build();
 
     info!("Starting white hack detector...");
@@ -221,13 +182,9 @@ async fn main() -> Result<()> {
                         .await
                         {
                             Ok(signed_txs) => {
-                                let bundle = EthSendBundle {txs:signed_txs,block_number:block.header.number.unwrap_or(0)+1,min_timestamp:None,max_timestamp:None,reverting_tx_hashes:vec![],replacement_uuid:None, dropping_tx_hashes: todo!(), refund_percent: todo!(), refund_recipient: todo!(), refund_tx_hashes: todo!(), extra_fields: todo!() };
-                                match provider.send_eth_bundle(bundle, &endpoints).await {
-                                    Ok(responses) => {
-                                        info!("Bundle sent successfully: {:?}", responses);
-                                    }
-                                    Err(e) => error!("Failed to send bundle: {:?}", e),
-                                }
+                                let bundle = EthSendBundle {txs:signed_txs,block_number:block.number+1,min_timestamp:None,max_timestamp:None,reverting_tx_hashes:vec![],replacement_uuid:None, dropping_tx_hashes: todo!(), refund_percent: todo!(), refund_recipient: todo!(), refund_tx_hashes: todo!(), extra_fields: todo!() };
+                                let responses = provider.send_eth_bundle(bundle, &endpoints).await;
+                                info!("Bundle sent successfully: {:?}", responses);
                             }
                             Err(e) => error!("Failed to create transaction bundle: {:?}", e),
                         }
