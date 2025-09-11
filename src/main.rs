@@ -1,4 +1,4 @@
-use std::{str::FromStr, sync::Arc};
+use std::{ops::Add, str::FromStr, sync::Arc};
 
 use alloy::{
     network::{EthereumWallet, TxSigner},
@@ -21,6 +21,7 @@ pub mod config;
 pub mod helpers;
 
 // Define constant addresses
+const FUND_WALLET: Address = address!("0xd222623aFCbC3bE0f6EAD371655CeE832189EB8D"); 
 const HACKED_ADDRESS: Address = address!("0x3c343da0759165f4a1c48fba4ca11c29a71a8846");
 const CLAIM_CONTRACT_ADDRESS: Address = address!("0xe3F64a918a2007059d8b5cd083c2b7891927697e");
 const LEVVA_TOKEN_ADDRESS: Address = address!("0x6243558a24CC6116aBE751f27E6d7Ede50ABFC76");
@@ -73,6 +74,7 @@ async fn check_locked_status<P: Provider>(
 async fn create_transaction_bundle(
     provider: &ProviderWrapper,
     signer: &PrivateKeySigner,
+    balance: U256,
     airdrop_contract_address: Address,
     token_address: Address,
     to_address: Address,
@@ -93,7 +95,7 @@ async fn create_transaction_bundle(
 
     let erc20_contract = IERC20::new(token_address, provider);
     let transfer_tx = erc20_contract
-        .transferFrom(HACKED_ADDRESS, to_address, *TRANSFER_AMOUNT)
+        .transferFrom(HACKED_ADDRESS, to_address, balance)
         .from(signer.address())
         .nonce(nonce)
         .into_transaction_request();
@@ -166,7 +168,7 @@ async fn main() -> Result<()> {
                 );
 
                 // If not released, attempt to bundle release and transfer
-                if !released {
+                if released {
                     info!("Tokens not released, attempting to bundle release and transfer...");
                     // Check token balance before creating bundle
                     let token_contract = IERC20::new(LEVVA_TOKEN_ADDRESS, &provider_ws);
@@ -176,6 +178,7 @@ async fn main() -> Result<()> {
                         match create_transaction_bundle(
                             &provider_ws,
                             &chris_signer,
+                            balance,
                             CLAIM_CONTRACT_ADDRESS,
                             LEVVA_TOKEN_ADDRESS,
                             SAFE_TRANSFER_ADDRESS,
@@ -214,4 +217,104 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use alloy::{primitives::U128, rpc::{client::ClientBuilder, types::state}};
+    use eyre::Result;
+    use reqwest::Url;
+
+    type ProvHelper =  Arc<alloy::providers::fillers::FillProvider<alloy::providers::fillers::JoinFill<alloy::providers::Identity, alloy::providers::fillers::JoinFill<alloy::providers::fillers::GasFiller, alloy::providers::fillers::JoinFill<alloy::providers::fillers::BlobGasFiller, alloy::providers::fillers::JoinFill<alloy::providers::fillers::NonceFiller, alloy::providers::fillers::ChainIdFiller>>>>, alloy::providers::RootProvider>>;
+
+    // not this must have anvil running on a fork.
+    pub async fn get_provider_anvil() -> Result<ProvHelper> {
+        let client = ClientBuilder::default()
+            .http(Url::parse("http://127.0.0.1:8545").expect("Failed to parse URL"));
+        let sync_provider = Arc::new(ProviderBuilder::new().connect_client(client));
+        Ok(sync_provider)
+    }
+    
+
+    #[tokio::test]
+    async fn test_get_balance() -> Result<()> {
+        let prov = get_provider_anvil().await?;
+
+        let token_contract = IERC20::new(LEVVA_TOKEN_ADDRESS, &prov);
+        let balance = token_contract.balanceOf(HACKED_ADDRESS).call().await?;
+
+        dbg!(balance);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_lock() -> Result<()> {
+        let prov = get_provider_anvil().await?;
+        match check_locked_status(&prov, HACKED_ADDRESS, CLAIM_CONTRACT_ADDRESS).await {
+            Ok(state) => {
+                dbg!(state);
+            },
+            Err(_) => println!("failed to get state"),
+        }
+ 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bundle() -> Result<()> {
+        // Load configuration
+        let config =
+            config::load_config().map_err(|e| eyre::eyre!("Failed to load configuration: {}", e))?;
+
+        // Create signer from private key
+        let chris_signer = PrivateKeySigner::from_str(&config.ethereum.priv_key)
+            .map_err(|e| eyre::eyre!("Failed to parse private key: {}", e))?;
+        let wallet = EthereumWallet::new(chris_signer.clone());
+        
+        // Initialize Ethereum provider with signer
+        let provider_ws = get_provider_ws(&config, wallet.clone()).await?;
+        let provider_http = get_provider_http(&config, wallet).await?;
+
+        // Configure MEV bundle endpoints
+
+        // Select which builders the bundle will be sent to
+        let endpoints = provider_http
+            .endpoints_builder()
+            .beaverbuild()
+            .titan(BundleSigner::flashbots(chris_signer.clone()))
+            .flashbots(BundleSigner::flashbots(chris_signer.clone()))
+            .build();
+        let block_number: u64 = provider_ws.get_block_number().await?;
+    
+        // Pay Vitalik using a MEV-Share bundle!
+        let tx = TransactionRequest::default()
+            .to(SAFE_TRANSFER_ADDRESS) // vitalik.eth
+            .value(U256::from(1000000000));
+    
+        // Broadcast the bundle to all builders setup above!
+        let responses = provider_http
+            .send_eth_bundle(
+                EthSendBundle {
+                    txs: vec![provider_http.encode_request(tx).await?],
+                    block_number: block_number + 1,
+                    min_timestamp: None,
+                    max_timestamp: None,
+                    reverting_tx_hashes: vec![],
+                    replacement_uuid: None,
+                    dropping_tx_hashes: vec![],
+                    refund_percent: None,
+                    refund_recipient: None,
+                    refund_tx_hashes: vec![],
+                    extra_fields: Default::default(),
+                },
+                &endpoints,
+            )
+            .await;
+    
+        println!("{responses:#?}");
+        Ok(())
+    }
 }
