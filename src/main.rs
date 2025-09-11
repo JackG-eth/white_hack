@@ -30,6 +30,11 @@ static TRANSFER_AMOUNT: Lazy<U256> = Lazy::new(|| {
     U256::from_str_radix("821600000000000000000000", 10).expect("Invalid TRANSFER_AMOUNT")
 });
 
+
+// todo work out exact time
+// todo read through all logic
+// todo add logic to also transfer from my wallet /after too?
+// todo check if the hacker does anything in next couple of days
 // Define Solidity interfaces using `sol!` macro
 sol! {
     #[derive(Debug, PartialEq, Eq)]
@@ -120,7 +125,7 @@ async fn main() -> Result<()> {
         config::load_config().map_err(|e| eyre::eyre!("Failed to load configuration: {}", e))?;
 
     // Create signer from private key
-    let chris_signer = PrivateKeySigner::from_str(&config.ethereum.priv_key)
+    let chris_signer = PrivateKeySigner::from_str(&config.ethereum.chris_priv_key)
         .map_err(|e| eyre::eyre!("Failed to parse private key: {}", e))?;
     let wallet = EthereumWallet::new(chris_signer.clone());
 
@@ -169,14 +174,14 @@ async fn main() -> Result<()> {
 
                 // If not released, attempt to bundle release and transfer
                 if released {
-                    info!("Tokens not released, attempting to bundle release and transfer...");
+                    info!("Tokens  released, attempting to bundle release and transfer...");
                     // Check token balance before creating bundle
                     let token_contract = IERC20::new(LEVVA_TOKEN_ADDRESS, &provider_ws);
                     let balance = token_contract.balanceOf(HACKED_ADDRESS).call().await?;
 
                     if balance != U256::from(0) {
                         match create_transaction_bundle(
-                            &provider_ws,
+                            &provider_http,
                             &chris_signer,
                             balance,
                             CLAIM_CONTRACT_ADDRESS,
@@ -265,12 +270,73 @@ mod tests {
 
     #[tokio::test]
     async fn test_bundle() -> Result<()> {
+        tracing_subscriber::fmt().init();
         // Load configuration
         let config =
             config::load_config().map_err(|e| eyre::eyre!("Failed to load configuration: {}", e))?;
 
         // Create signer from private key
-        let chris_signer = PrivateKeySigner::from_str(&config.ethereum.priv_key)
+        let chris_signer = PrivateKeySigner::from_str(&config.ethereum.chris_priv_key)
+            .map_err(|e| eyre::eyre!("Failed to parse private key: {}", e))?;
+        let wallet = EthereumWallet::new(chris_signer.clone());
+        
+        // Initialize Ethereum provider with signer
+        let provider_ws = get_provider_ws(&config, wallet.clone()).await?;
+        let provider_http = get_provider_http(&config, wallet).await?;
+        // Select which builders the bundle will be sent to
+        let endpoints = provider_http
+            .endpoints_builder()
+            .beaverbuild()
+            .titan(BundleSigner::flashbots(chris_signer.clone()))
+            .flashbots(BundleSigner::flashbots(chris_signer.clone()))
+            .build();
+
+
+        let block_number: u64 = provider_ws.get_block_number().await?;
+    
+        match create_transaction_bundle(
+            &provider_ws,
+            &chris_signer,
+            *TRANSFER_AMOUNT,
+            CLAIM_CONTRACT_ADDRESS,
+            LEVVA_TOKEN_ADDRESS,
+            SAFE_TRANSFER_ADDRESS,
+        )
+        .await
+        {
+            Ok(signed_txs) => {
+                info!("Signed txs: {:?}", signed_txs);
+                let bundle = EthSendBundle {
+                    txs: signed_txs,
+                    block_number: block_number + 1,
+                    min_timestamp: None,
+                    max_timestamp: None,
+                    reverting_tx_hashes: vec![],
+                    replacement_uuid: None,
+                    dropping_tx_hashes: vec![],
+                    refund_percent: None,
+                    refund_recipient: None,
+                    refund_tx_hashes: vec![],
+                    extra_fields: Default::default(),
+                };
+                let responses =
+                    provider_http.send_eth_bundle(bundle, &endpoints).await;
+                    info!("Bundle sent successfully: {:?}", responses);
+            }
+            Err(e) => error!("Failed to create transaction bundle: {:?}", e),
+        }
+    
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bundle_real() -> Result<()> {
+        // Load configuration
+        let config =
+            config::load_config().map_err(|e| eyre::eyre!("Failed to load configuration: {}", e))?;
+
+        // Create signer from private key
+        let chris_signer = PrivateKeySigner::from_str(&config.ethereum.my_priv_key)
             .map_err(|e| eyre::eyre!("Failed to parse private key: {}", e))?;
         let wallet = EthereumWallet::new(chris_signer.clone());
         
@@ -290,7 +356,12 @@ mod tests {
         let block_number: u64 = provider_ws.get_block_number().await?;
     
         // Pay Vitalik using a MEV-Share bundle!
-        let tx = TransactionRequest::default()
+        let tx_1 = TransactionRequest::default()
+            .to(HACKED_ADDRESS) // vitalik.eth
+            .value(U256::from(1000000000));
+            
+        // Pay Vitalik using a MEV-Share bundle!
+        let tx_2 = TransactionRequest::default()
             .to(SAFE_TRANSFER_ADDRESS) // vitalik.eth
             .value(U256::from(1000000000));
     
@@ -298,7 +369,7 @@ mod tests {
         let responses = provider_http
             .send_eth_bundle(
                 EthSendBundle {
-                    txs: vec![provider_http.encode_request(tx).await?],
+                    txs: vec![provider_http.encode_request(tx_1).await?,provider_http.encode_request(tx_2).await?],
                     block_number: block_number + 1,
                     min_timestamp: None,
                     max_timestamp: None,
