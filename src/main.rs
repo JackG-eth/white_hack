@@ -2,10 +2,10 @@ use std::{str::FromStr, sync::Arc};
 
 use alloy::{
     network::{EthereumWallet, TxSigner},
-    primitives::{address, Address, Bytes, U256},
+    primitives::{Address, Bytes, U256, address},
     providers::{Provider, ProviderBuilder, WsConnect},
-    rpc::types::{mev::EthSendBundle, TransactionInput, TransactionRequest},
-    signers::local::PrivateKeySigner,
+    rpc::types::{TransactionInput, TransactionRequest, mev::EthSendBundle},
+    signers::{k256::elliptic_curve::consts::U2, local::PrivateKeySigner},
     sol,
 };
 use alloy_mev::{BundleSigner, EthMevProviderExt};
@@ -15,11 +15,10 @@ use once_cell::sync::Lazy;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use crate::helpers::{get_provider, ProviderWrapper};
+use crate::helpers::{ProviderWrapper, get_provider_http, get_provider_ws};
 
-
-pub mod helpers;
 pub mod config;
+pub mod helpers;
 
 // Define constant addresses
 const HACKED_ADDRESS: Address = address!("0x3c343da0759165f4a1c48fba4ca11c29a71a8846");
@@ -78,7 +77,6 @@ async fn create_transaction_bundle(
     token_address: Address,
     to_address: Address,
 ) -> Result<Vec<Bytes>> {
-
     let nonce = provider
         .get_transaction_count(signer.address())
         .await
@@ -100,7 +98,6 @@ async fn create_transaction_bundle(
         .nonce(nonce)
         .into_transaction_request();
 
-
     let encoded_transfer_tx = provider.encode_request(transfer_tx).await?;
 
     Ok(vec![encoded_release_tx, encoded_transfer_tx])
@@ -117,20 +114,22 @@ async fn main() -> Result<()> {
         .init();
 
     // Load configuration
-    let config = config::load_config().map_err(|e|  eyre::eyre!("Failed to load configuration: {}", e))?;
- 
+    let config =
+        config::load_config().map_err(|e| eyre::eyre!("Failed to load configuration: {}", e))?;
+
     // Create signer from private key
     let chris_signer = PrivateKeySigner::from_str(&config.ethereum.priv_key)
         .map_err(|e| eyre::eyre!("Failed to parse private key: {}", e))?;
     let wallet = EthereumWallet::new(chris_signer.clone());
 
     // Initialize Ethereum provider with signer
-    let provider = get_provider(&config, wallet).await?;
+    let provider_ws = get_provider_ws(&config, wallet.clone()).await?;
+    let provider_http = get_provider_http(&config, wallet).await?;
 
     // Configure MEV bundle endpoints
 
     // Select which builders the bundle will be sent to
-    let endpoints = provider
+    let endpoints = provider_http
         .endpoints_builder()
         .beaverbuild()
         .titan(BundleSigner::flashbots(chris_signer.clone()))
@@ -141,7 +140,7 @@ async fn main() -> Result<()> {
     info!("TRANSFER_AMOUNT: {}", *TRANSFER_AMOUNT);
 
     // Subscribe to new blocks
-    let mut block_stream = provider
+    let mut block_stream = provider_ws
         .subscribe_blocks()
         .await
         .map_err(|e| eyre::eyre!("Failed to subscribe to blocks: {}", e))?
@@ -152,7 +151,7 @@ async fn main() -> Result<()> {
         info!("Received new block: {:?}", block.number);
 
         // Check locked status for HACKED_ADDRESS
-        match check_locked_status(&provider, HACKED_ADDRESS, CLAIM_CONTRACT_ADDRESS).await {
+        match check_locked_status(&provider_ws, HACKED_ADDRESS, CLAIM_CONTRACT_ADDRESS).await {
             Ok(locked_status) => {
                 info!("Locked status for {}: {:?}", HACKED_ADDRESS, locked_status);
                 let ILevvaAirdrop::lockedReturn {
@@ -170,10 +169,12 @@ async fn main() -> Result<()> {
                 if !released {
                     info!("Tokens not released, attempting to bundle release and transfer...");
                     // Check token balance before creating bundle
-                    let token_contract = IERC20::new(LEVVA_TOKEN_ADDRESS, &provider);
+                    let token_contract = IERC20::new(LEVVA_TOKEN_ADDRESS, &provider_ws);
+                    let balance = token_contract.balanceOf(HACKED_ADDRESS).call().await?;
 
+                    if balance != U256::from(0) {
                         match create_transaction_bundle(
-                            &provider,
+                            &provider_ws,
                             &chris_signer,
                             CLAIM_CONTRACT_ADDRESS,
                             LEVVA_TOKEN_ADDRESS,
@@ -182,12 +183,28 @@ async fn main() -> Result<()> {
                         .await
                         {
                             Ok(signed_txs) => {
-                                let bundle = EthSendBundle {txs:signed_txs,block_number:block.number+1,min_timestamp:None,max_timestamp:None,reverting_tx_hashes:vec![],replacement_uuid:None, dropping_tx_hashes: todo!(), refund_percent: todo!(), refund_recipient: todo!(), refund_tx_hashes: todo!(), extra_fields: todo!() };
-                                let responses = provider.send_eth_bundle(bundle, &endpoints).await;
+                                let bundle = EthSendBundle {
+                                    txs: signed_txs,
+                                    block_number: block.number + 1,
+                                    min_timestamp: None,
+                                    max_timestamp: None,
+                                    reverting_tx_hashes: vec![],
+                                    replacement_uuid: None,
+                                    dropping_tx_hashes: vec![],
+                                    refund_percent: None,
+                                    refund_recipient: None,
+                                    refund_tx_hashes: vec![],
+                                    extra_fields: Default::default(),
+                                };
+                                let responses =
+                                    provider_http.send_eth_bundle(bundle, &endpoints).await;
                                 info!("Bundle sent successfully: {:?}", responses);
                             }
                             Err(e) => error!("Failed to create transaction bundle: {:?}", e),
                         }
+                    } else {
+                        continue;
+                    }
                 }
             }
             Err(e) => {
