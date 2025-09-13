@@ -1,4 +1,8 @@
-use std::{ops::Add, str::FromStr, sync::Arc};
+use std::{
+    ops::Add,
+    str::FromStr,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use alloy::{
     network::{EthereumWallet, TxSigner},
@@ -20,8 +24,15 @@ use crate::helpers::{ProviderWrapper, get_provider_http, get_provider_ws};
 pub mod config;
 pub mod helpers;
 
+/*
+Format	Seconds
+GMT	Sat Sep 13 2025 16:14:23 GMT+0000
+Your Time Zone	Sat Sep 13 2025 17:14:23 GMT+0100 (British Summer Time)
+Relative	in 8 hours
+*/
+
 // Define constant addresses
-const FUND_WALLET: Address = address!("0xd222623aFCbC3bE0f6EAD371655CeE832189EB8D"); 
+const FUND_WALLET: Address = address!("0xd222623aFCbC3bE0f6EAD371655CeE832189EB8D");
 const HACKED_ADDRESS: Address = address!("0x3c343da0759165f4a1c48fba4ca11c29a71a8846");
 const CLAIM_CONTRACT_ADDRESS: Address = address!("0xe3F64a918a2007059d8b5cd083c2b7891927697e");
 const LEVVA_TOKEN_ADDRESS: Address = address!("0x6243558a24CC6116aBE751f27E6d7Ede50ABFC76");
@@ -30,11 +41,6 @@ static TRANSFER_AMOUNT: Lazy<U256> = Lazy::new(|| {
     U256::from_str_radix("821600000000000000000000", 10).expect("Invalid TRANSFER_AMOUNT")
 });
 
-
-// todo work out exact time
-// todo read through all logic
-// todo add logic to also transfer from my wallet /after too?
-// todo check if the hacker does anything in next couple of days
 // Define Solidity interfaces using `sol!` macro
 sol! {
     #[derive(Debug, PartialEq, Eq)]
@@ -120,6 +126,8 @@ async fn main() -> Result<()> {
         .with_thread_ids(true)
         .init();
 
+    let complete = AtomicBool::new(false);
+
     // Load configuration
     let config =
         config::load_config().map_err(|e| eyre::eyre!("Failed to load configuration: {}", e))?;
@@ -157,10 +165,13 @@ async fn main() -> Result<()> {
     while let Some(block) = block_stream.next().await {
         info!("Received new block: {:?}", block.number);
 
+        if complete.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+
         // Check locked status for HACKED_ADDRESS
         match check_locked_status(&provider_ws, HACKED_ADDRESS, CLAIM_CONTRACT_ADDRESS).await {
             Ok(locked_status) => {
-                info!("Locked status for {}: {:?}", HACKED_ADDRESS, locked_status);
                 let ILevvaAirdrop::lockedReturn {
                     amount,
                     lockedTill,
@@ -206,7 +217,8 @@ async fn main() -> Result<()> {
                                 };
                                 let responses =
                                     provider_http.send_eth_bundle(bundle, &endpoints).await;
-                                info!("Bundle sent successfully: {:?}", responses);
+                                info!("Repsonses {:?}", responses);
+                                complete.fetch_and(true, std::sync::atomic::Ordering::SeqCst);
                             }
                             Err(e) => error!("Failed to create transaction bundle: {:?}", e),
                         }
@@ -220,6 +232,49 @@ async fn main() -> Result<()> {
             }
         }
     }
+    
+    let block_number: u64 = provider_ws.get_block_number().await?;
+
+    let balance = provider_ws.get_balance(HACKED_ADDRESS).await?;
+    let gas_limit = U256::from(25_000);
+    let gas_price = provider_ws.get_gas_price().await?;
+    let gas_cost = gas_limit.checked_mul(U256::from(gas_price)).ok_or_else(|| eyre::eyre!("Gas cost calculation failed"))?;
+    
+    // Ensure balance is sufficient
+    if balance < gas_cost {
+        return Err(eyre::eyre!("Insufficient balance: have {}, need at least {}", balance, gas_cost));
+    }
+    
+    // Add a buffer (e.g., 10% of gas_cost) to account for gas estimation
+    let buffer = gas_cost.checked_div(U256::from(10)).expect("failed to create buffer");
+    let value_to_send = balance.checked_sub(gas_cost + buffer)
+        .ok_or_else(|| eyre::eyre!("Cannot calculate value to send: balance too low"))?;
+
+    let tx_1 = TransactionRequest::default()
+        .to(FUND_WALLET) // vitalik.eth
+        .value(value_to_send);
+
+    // Broadcast the bundle to all builders setup above!
+    let responses = provider_http
+        .send_eth_bundle(
+            EthSendBundle {
+                txs: vec![provider_http.encode_request(tx_1).await?],
+                block_number: block_number + 1,
+                min_timestamp: None,
+                max_timestamp: None,
+                reverting_tx_hashes: vec![],
+                replacement_uuid: None,
+                dropping_tx_hashes: vec![],
+                refund_percent: None,
+                refund_recipient: None,
+                refund_tx_hashes: vec![],
+                extra_fields: Default::default(),
+            },
+            &endpoints,
+        )
+        .await;
+
+    println!("{responses:#?}");
 
     Ok(())
 }
@@ -228,11 +283,31 @@ async fn main() -> Result<()> {
 mod tests {
 
     use super::*;
-    use alloy::{primitives::U128, rpc::{client::ClientBuilder, types::state}};
+    use alloy::{
+        primitives::U128,
+        rpc::{client::ClientBuilder, types::state},
+    };
     use eyre::Result;
     use reqwest::Url;
 
-    type ProvHelper =  Arc<alloy::providers::fillers::FillProvider<alloy::providers::fillers::JoinFill<alloy::providers::Identity, alloy::providers::fillers::JoinFill<alloy::providers::fillers::GasFiller, alloy::providers::fillers::JoinFill<alloy::providers::fillers::BlobGasFiller, alloy::providers::fillers::JoinFill<alloy::providers::fillers::NonceFiller, alloy::providers::fillers::ChainIdFiller>>>>, alloy::providers::RootProvider>>;
+    type ProvHelper = Arc<
+        alloy::providers::fillers::FillProvider<
+            alloy::providers::fillers::JoinFill<
+                alloy::providers::Identity,
+                alloy::providers::fillers::JoinFill<
+                    alloy::providers::fillers::GasFiller,
+                    alloy::providers::fillers::JoinFill<
+                        alloy::providers::fillers::BlobGasFiller,
+                        alloy::providers::fillers::JoinFill<
+                            alloy::providers::fillers::NonceFiller,
+                            alloy::providers::fillers::ChainIdFiller,
+                        >,
+                    >,
+                >,
+            >,
+            alloy::providers::RootProvider,
+        >,
+    >;
 
     // not this must have anvil running on a fork.
     pub async fn get_provider_anvil() -> Result<ProvHelper> {
@@ -241,7 +316,6 @@ mod tests {
         let sync_provider = Arc::new(ProviderBuilder::new().connect_client(client));
         Ok(sync_provider)
     }
-    
 
     #[tokio::test]
     async fn test_get_balance() -> Result<()> {
@@ -261,25 +335,25 @@ mod tests {
         match check_locked_status(&prov, HACKED_ADDRESS, CLAIM_CONTRACT_ADDRESS).await {
             Ok(state) => {
                 dbg!(state);
-            },
+            }
             Err(_) => println!("failed to get state"),
         }
- 
+
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_bundle() -> Result<()> {
+    async fn test_get_release() -> Result<()> {
         tracing_subscriber::fmt().init();
         // Load configuration
-        let config =
-            config::load_config().map_err(|e| eyre::eyre!("Failed to load configuration: {}", e))?;
+        let config = config::load_config()
+            .map_err(|e| eyre::eyre!("Failed to load configuration: {}", e))?;
 
         // Create signer from private key
         let chris_signer = PrivateKeySigner::from_str(&config.ethereum.chris_priv_key)
             .map_err(|e| eyre::eyre!("Failed to parse private key: {}", e))?;
         let wallet = EthereumWallet::new(chris_signer.clone());
-        
+
         // Initialize Ethereum provider with signer
         let provider_ws = get_provider_ws(&config, wallet.clone()).await?;
         let provider_http = get_provider_http(&config, wallet).await?;
@@ -291,9 +365,72 @@ mod tests {
             .flashbots(BundleSigner::flashbots(chris_signer.clone()))
             .build();
 
+        let block_number: u64 = provider_ws.get_block_number().await?;
+
+        let nonce = provider_http
+        .get_transaction_count(chris_signer.address())
+        .await
+        .map_err(|e| eyre::eyre!("Failed to get nonce: {}", e))?;
+
+    // Create release transaction
+        let airdrop_contract = ILevvaAirdrop::new(CLAIM_CONTRACT_ADDRESS, provider_http.clone());
+        let release_tx = airdrop_contract
+            .release()
+            .from(chris_signer.address())
+            .nonce(nonce)
+            .into_transaction_request();
+        let encoded_release_tx = provider_http.encode_request(release_tx).await?;
+
+                // Broadcast the bundle to all builders setup above!
+                let responses = provider_http
+                .send_eth_bundle(
+                    EthSendBundle {
+                        txs: vec![encoded_release_tx],
+                        block_number: block_number + 1,
+                        min_timestamp: None,
+                        max_timestamp: None,
+                        reverting_tx_hashes: vec![],
+                        replacement_uuid: None,
+                        dropping_tx_hashes: vec![],
+                        refund_percent: None,
+                        refund_recipient: None,
+                        refund_tx_hashes: vec![],
+                        extra_fields: Default::default(),
+                    },
+                    &endpoints,
+                )
+                .await;
+    
+            println!("{responses:#?}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bundle() -> Result<()> {
+        tracing_subscriber::fmt().init();
+        // Load configuration
+        let config = config::load_config()
+            .map_err(|e| eyre::eyre!("Failed to load configuration: {}", e))?;
+
+        // Create signer from private key
+        let chris_signer = PrivateKeySigner::from_str(&config.ethereum.chris_priv_key)
+            .map_err(|e| eyre::eyre!("Failed to parse private key: {}", e))?;
+        let wallet = EthereumWallet::new(chris_signer.clone());
+
+        // Initialize Ethereum provider with signer
+        let provider_ws = get_provider_ws(&config, wallet.clone()).await?;
+        let provider_http = get_provider_http(&config, wallet).await?;
+        // Select which builders the bundle will be sent to
+        let endpoints = provider_http
+            .endpoints_builder()
+            .beaverbuild()
+            .titan(BundleSigner::flashbots(chris_signer.clone()))
+            .flashbots(BundleSigner::flashbots(chris_signer.clone()))
+            .build();
 
         let block_number: u64 = provider_ws.get_block_number().await?;
-    
+
         match create_transaction_bundle(
             &provider_ws,
             &chris_signer,
@@ -319,32 +456,29 @@ mod tests {
                     refund_tx_hashes: vec![],
                     extra_fields: Default::default(),
                 };
-                let responses =
-                    provider_http.send_eth_bundle(bundle, &endpoints).await;
-                    info!("Bundle sent successfully: {:?}", responses);
+                let responses = provider_http.send_eth_bundle(bundle, &endpoints).await;
+                info!("Bundle sent successfully: {:?}", responses);
             }
             Err(e) => error!("Failed to create transaction bundle: {:?}", e),
         }
-    
+
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_bundle_real() -> Result<()> {
+    async fn test_bundle_transfer_to_hacked() -> Result<()> {
         // Load configuration
-        let config =
-            config::load_config().map_err(|e| eyre::eyre!("Failed to load configuration: {}", e))?;
+        let config = config::load_config()
+            .map_err(|e| eyre::eyre!("Failed to load configuration: {}", e))?;
 
         // Create signer from private key
         let chris_signer = PrivateKeySigner::from_str(&config.ethereum.my_priv_key)
             .map_err(|e| eyre::eyre!("Failed to parse private key: {}", e))?;
         let wallet = EthereumWallet::new(chris_signer.clone());
-        
+
         // Initialize Ethereum provider with signer
         let provider_ws = get_provider_ws(&config, wallet.clone()).await?;
         let provider_http = get_provider_http(&config, wallet).await?;
-
-        // Configure MEV bundle endpoints
 
         // Select which builders the bundle will be sent to
         let endpoints = provider_http
@@ -354,22 +488,85 @@ mod tests {
             .flashbots(BundleSigner::flashbots(chris_signer.clone()))
             .build();
         let block_number: u64 = provider_ws.get_block_number().await?;
-    
+
         // Pay Vitalik using a MEV-Share bundle!
         let tx_1 = TransactionRequest::default()
             .to(HACKED_ADDRESS) // vitalik.eth
-            .value(U256::from(1000000000));
-            
-        // Pay Vitalik using a MEV-Share bundle!
-        let tx_2 = TransactionRequest::default()
-            .to(SAFE_TRANSFER_ADDRESS) // vitalik.eth
-            .value(U256::from(1000000000));
+            .value(U256::from(10_000_000_000_000_000u128));
+
+        // Broadcast the bundle to all builders setup above!
+        let responses = provider_http
+            .send_eth_bundle(
+                EthSendBundle {
+                    txs: vec![provider_http.encode_request(tx_1).await?],
+                    block_number: block_number + 1,
+                    min_timestamp: None,
+                    max_timestamp: None,
+                    reverting_tx_hashes: vec![],
+                    replacement_uuid: None,
+                    dropping_tx_hashes: vec![],
+                    refund_percent: None,
+                    refund_recipient: None,
+                    refund_tx_hashes: vec![],
+                    extra_fields: Default::default(),
+                },
+                &endpoints,
+            )
+            .await;
+
+        println!("{responses:#?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bundle_transfer_from_hacked() -> Result<()> {
+        // Load configuration
+        let config = config::load_config()
+            .map_err(|e| eyre::eyre!("Failed to load configuration: {}", e))?;
+
+        // Create signer from private key
+        let chris_signer = PrivateKeySigner::from_str(&config.ethereum.chris_priv_key)
+            .map_err(|e| eyre::eyre!("Failed to parse private key: {}", e))?;
+        let wallet = EthereumWallet::new(chris_signer.clone());
+
+        // Initialize Ethereum provider with signer
+        let provider_ws = get_provider_ws(&config, wallet.clone()).await?;
+        let provider_http = get_provider_http(&config, wallet).await?;
+
+        // Select which builders the bundle will be sent to
+        let endpoints = provider_http
+            .endpoints_builder()
+            .beaverbuild()
+            .titan(BundleSigner::flashbots(chris_signer.clone()))
+            .flashbots(BundleSigner::flashbots(chris_signer.clone()))
+            .build();
+        
+        let block_number: u64 = provider_ws.get_block_number().await?;
+
+        let balance = provider_ws.get_balance(HACKED_ADDRESS).await?;
+        let gas_limit = U256::from(25_000);
+        let gas_price = provider_ws.get_gas_price().await?;
+        let gas_cost = gas_limit.checked_mul(U256::from(gas_price)).ok_or_else(|| eyre::eyre!("Gas cost calculation failed"))?;
+        
+        // Ensure balance is sufficient
+        if balance < gas_cost {
+            return Err(eyre::eyre!("Insufficient balance: have {}, need at least {}", balance, gas_cost));
+        }
+        
+        // Add a buffer (e.g., 10% of gas_cost) to account for gas estimation
+        let buffer = gas_cost.checked_div(U256::from(10)).expect("failed to create buffer");
+        let value_to_send = balance.checked_sub(gas_cost + buffer)
+            .ok_or_else(|| eyre::eyre!("Cannot calculate value to send: balance too low"))?;
+    
+        let tx_1 = TransactionRequest::default()
+            .to(FUND_WALLET) // vitalik.eth
+            .value(value_to_send);
     
         // Broadcast the bundle to all builders setup above!
         let responses = provider_http
             .send_eth_bundle(
                 EthSendBundle {
-                    txs: vec![provider_http.encode_request(tx_1).await?,provider_http.encode_request(tx_2).await?],
+                    txs: vec![provider_http.encode_request(tx_1).await?],
                     block_number: block_number + 1,
                     min_timestamp: None,
                     max_timestamp: None,
